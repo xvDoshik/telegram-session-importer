@@ -1,0 +1,1007 @@
+import base64
+import hashlib
+import os
+import shlex
+import sqlite3
+import tempfile
+import time
+import traceback
+from pathlib import Path
+
+from base_plugin import BasePlugin, HookResult
+from java import jclass
+
+try:
+    from android_utils import log, run_on_ui_thread
+except Exception:
+    def log(message):
+        pass
+
+    def run_on_ui_thread(fn, delay=0):
+        fn()
+
+try:
+    from client_utils import get_last_fragment, run_on_queue
+except Exception:
+    get_last_fragment = None
+
+    def run_on_queue(fn):
+        fn()
+
+try:
+    from ui.alert import AlertDialogBuilder
+except Exception:
+    AlertDialogBuilder = None
+
+try:
+    from ui.bulletin import BulletinHelper
+except Exception:
+    BulletinHelper = None
+
+try:
+    from ui.settings import Divider, Header, Text
+except Exception:
+    Divider = Header = Text = None
+
+
+__id__ = "telegram_session_importer"
+__name__ = "Telegram session importer"
+__description__ = "Imports Telegram .session files into AyuGram/exteraGram account slots."
+__author__ = "xv_Dosha"
+__version__ = "1.0.0"
+__icon__ = "msg_plugins"
+__min_version__ = "11.12.0"
+
+LOG_TAG = "[tg_sess]"
+STATE_NOTE = "idle"
+RECENT_SOURCE = ""
+
+
+class DcRegistry:
+    MAP = {
+        1: {
+            "v4": [("149.154.175.52", 443, 0, ""), ("149.154.175.54", 443, 16, "")],
+            "v6": [("2001:0b28:f23d:f001:0000:0000:0000:000a", 443, 1, "")],
+            "v4dl": [],
+            "v6dl": [],
+        },
+        2: {
+            "v4": [("149.154.167.41", 443, 0, "")],
+            "v6": [("2001:067c:04e8:f002:0000:0000:0000:000a", 443, 1, "")],
+            "v4dl": [("149.154.167.151", 443, 2, "")],
+            "v6dl": [("2001:067c:04e8:f002:0000:0000:0000:000b", 443, 3, "")],
+        },
+        3: {
+            "v4": [("149.154.175.100", 443, 0, "")],
+            "v6": [("2001:0b28:f23d:f003:0000:0000:0000:000a", 443, 1, "")],
+            "v4dl": [],
+            "v6dl": [],
+        },
+        4: {
+            "v4": [("149.154.167.92", 443, 0, "")],
+            "v6": [("2001:067c:04e8:f004:0000:0000:0000:000a", 443, 1, "")],
+            "v4dl": [("149.154.165.96", 443, 2, "")],
+            "v6dl": [("2001:067c:04e8:f004:0000:0000:0000:000b", 443, 3, "")],
+        },
+        5: {
+            "v4": [("91.108.56.197", 443, 0, "")],
+            "v6": [("2001:0b28:f23f:f005:0000:0000:0000:000a", 443, 1, "")],
+            "v4dl": [],
+            "v6dl": [],
+        },
+    }
+
+    GROUPS = ("v4", "v6", "v4dl", "v6dl")
+
+
+class TgBinaryWriter:
+    @staticmethod
+    def i32(buf, value, signed=True):
+        buf.extend(int(value).to_bytes(4, "little", signed=signed))
+
+    @staticmethod
+    def i64(buf, value, signed=True):
+        buf.extend(int(value).to_bytes(8, "little", signed=signed))
+
+    @staticmethod
+    def flag(buf, value):
+        TgBinaryWriter.i32(buf, 0x997275B5 if value else 0xBC799737, signed=False)
+
+    @staticmethod
+    def bytes_blob(buf, data):
+        data = bytes(data)
+        n = len(data)
+        if n < 254:
+            buf.append(n)
+            head = 1
+        else:
+            buf.append(254)
+            buf.extend(n.to_bytes(3, "little", signed=False))
+            head = 4
+        buf.extend(data)
+        pad = (4 - ((n + head) % 4)) % 4
+        if pad:
+            buf.extend(b"\x00" * pad)
+
+    @staticmethod
+    def text(buf, value):
+        TgBinaryWriter.bytes_blob(buf, str(value or "").encode("utf-8"))
+
+
+class AppPaths:
+    @staticmethod
+    def ctx():
+        Loader = jclass("org.telegram.messenger.ApplicationLoader")
+        return Loader.applicationContext
+
+    @staticmethod
+    def internal_root():
+        Loader = jclass("org.telegram.messenger.ApplicationLoader")
+        try:
+            return Path(str(Loader.getFilesDirFixed().getAbsolutePath()))
+        except Exception:
+            return Path(str(AppPaths.ctx().getFilesDir().getAbsolutePath()))
+
+    @staticmethod
+    def slot_root(slot):
+        base = AppPaths.internal_root()
+        return base if slot == 0 else base / f"account{slot}"
+
+    @staticmethod
+    def prefs_key(slot):
+        return "userconfing" if slot == 0 else f"userconfig{slot}"
+
+    @staticmethod
+    def journal_dirs():
+        out = []
+        try:
+            out.append(AppPaths.internal_root() / "accounts")
+        except Exception:
+            pass
+        try:
+            ext = AppPaths.ctx().getExternalFilesDir(None)
+            if ext is not None:
+                out.append(Path(str(ext.getAbsolutePath())) / "accounts")
+        except Exception:
+            pass
+        out.extend([
+            Path("/sdcard/accounts"),
+            Path("/storage/emulated/0/accounts"),
+            Path("/sdcard/Download/accounts"),
+            Path("/storage/emulated/0/Download/accounts"),
+        ])
+        return out
+
+    @staticmethod
+    def scratch_dir():
+        try:
+            folder = AppPaths.internal_root() / "tg_sess_cache"
+        except Exception:
+            folder = Path(tempfile.gettempdir()) / "tg_sess_cache"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+
+class RuntimeLog:
+    @staticmethod
+    def push(msg):
+        global STATE_NOTE
+        STATE_NOTE = str(msg)
+        try:
+            log(LOG_TAG + " " + STATE_NOTE)
+        except Exception:
+            pass
+        RuntimeLog.persist(STATE_NOTE)
+
+    @staticmethod
+    def persist(msg):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{stamp} {msg}\n"
+        for folder in AppPaths.journal_dirs():
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                with open(folder / "tg_session_import.log", "a", encoding="utf-8") as fh:
+                    fh.write(line)
+                return
+            except Exception:
+                pass
+
+
+class TgNetBuilder:
+    @staticmethod
+    def key_fingerprint(raw_key):
+        return int.from_bytes(hashlib.sha1(raw_key).digest()[12:20], "little", signed=True)
+
+    @staticmethod
+    def pack(raw_key, dc_id):
+        if dc_id not in DcRegistry.MAP:
+            raise ValueError(f"unsupported dc_id={dc_id}")
+        if not raw_key or len(raw_key) != 256:
+            got = len(raw_key) if raw_key else 0
+            raise ValueError(f"auth_key must be 256 bytes, got {got}")
+
+        W = TgBinaryWriter
+        buf = bytearray()
+        W.i32(buf, 5)
+        W.flag(buf, False)
+        W.flag(buf, False)
+        W.text(buf, "en-us")
+        W.flag(buf, True)
+        W.i32(buf, dc_id, signed=False)
+        W.i32(buf, 0)
+        W.i32(buf, 0)
+        W.i64(buf, 0)
+        W.flag(buf, True)
+        W.i32(buf, 0)
+        W.i32(buf, 0)
+        W.i32(buf, 1)
+        W.i32(buf, 13)
+        W.i32(buf, dc_id)
+        W.i32(buf, 67502)
+        W.i32(buf, 67502)
+
+        dc = DcRegistry.MAP[dc_id]
+        for group in DcRegistry.GROUPS:
+            rows = dc[group]
+            W.i32(buf, len(rows))
+            for host, port, flags, secret in rows:
+                W.text(buf, host)
+                W.i32(buf, port)
+                W.i32(buf, flags)
+                W.text(buf, secret)
+
+        W.flag(buf, False)
+        W.i32(buf, len(raw_key), signed=False)
+        buf.extend(raw_key)
+        W.i64(buf, TgNetBuilder.key_fingerprint(raw_key))
+        W.i32(buf, 0)
+        W.i64(buf, 0)
+        W.i32(buf, 0)
+        W.i64(buf, 0)
+        W.i32(buf, 1)
+        W.i32(buf, 0)
+        W.i32(buf, 0)
+        return len(buf).to_bytes(4, "little", signed=False) + bytes(buf)
+
+
+class UserBlobEncoder:
+    @staticmethod
+    def parse_display_name(raw):
+        chunks = str(raw or "").strip().split(None, 1)
+        if not chunks:
+            return "", ""
+        if len(chunks) == 1:
+            return chunks[0], ""
+        return chunks[0], chunks[1]
+
+    @staticmethod
+    def encode(user_id, profile):
+        first = str(profile.get("first_name") or "").strip()
+        last = str(profile.get("last_name") or "").strip()
+        user = str(profile.get("username") or "").strip()
+        phone = str(profile.get("phone") or "").strip()
+        if not first:
+            first = "Session"
+
+        mask = 1024
+        if first:
+            mask |= 2
+        if last:
+            mask |= 4
+        if user:
+            mask |= 8
+        if phone:
+            mask |= 16
+
+        W = TgBinaryWriter
+        payload = bytearray()
+        W.i32(payload, 0x8F97C628, signed=False)
+        W.i32(payload, mask)
+        W.i32(payload, 0)
+        W.i64(payload, int(user_id))
+        if first:
+            W.text(payload, first)
+        if last:
+            W.text(payload, last)
+        if user:
+            W.text(payload, user)
+        if phone:
+            W.text(payload, phone)
+        return base64.b64encode(bytes(payload)).decode("ascii")
+
+
+class SessionSqlReader:
+    @staticmethod
+    def columns(db, table):
+        try:
+            return [str(row[1]) for row in db.execute(f"pragma table_info({table})").fetchall()]
+        except Exception:
+            return []
+
+    @staticmethod
+    def entity_rows(db, limit=12):
+        cols = SessionSqlReader.columns(db, "entities")
+        if not cols or "id" not in cols:
+            return []
+        fields = [c for c in ("id", "username", "phone", "name") if c in cols]
+        sql = "select " + ", ".join(fields) + " from entities where id > 0 order by id limit ?"
+        rows = db.execute(sql, (int(limit),)).fetchall()
+        out = []
+        for row in rows:
+            item = dict(zip(fields, row))
+            label = item.get("name") or ""
+            fn, ln = UserBlobEncoder.parse_display_name(label)
+            out.append({
+                "id": int(item.get("id") or 0),
+                "username": item.get("username") or "",
+                "phone": item.get("phone") or "",
+                "name": label,
+                "first_name": fn,
+                "last_name": ln,
+            })
+        return out
+
+    @staticmethod
+    def pick_profile(rows, uid_override=None):
+        if uid_override:
+            uid = int(uid_override)
+            for row in rows:
+                if int(row.get("id") or 0) == uid:
+                    return uid, row
+            return uid, {"first_name": "Session", "last_name": "", "username": "", "phone": "", "name": ""}
+        if not rows:
+            raise ValueError("could not infer user id from entities table; use .imp /path/file.session USER_ID")
+        ranked = sorted(
+            rows,
+            key=lambda item: (
+                0 if item.get("phone") else 1,
+                0 if item.get("name") else 1,
+                0 if item.get("username") else 1,
+                int(item.get("id") or 0),
+            ),
+        )
+        top = ranked[0]
+        return int(top["id"]), top
+
+    @staticmethod
+    def clone_sqlite(src):
+        dst = AppPaths.scratch_dir() / f"work_{int(time.time() * 1000)}.session"
+        FileOps.binary_copy(src, dst)
+        try:
+            os.chmod(dst, 0o600)
+        except Exception:
+            pass
+        return dst
+
+    @staticmethod
+    def load(path, uid_override=None):
+        src = Path(str(path))
+        if not src.exists():
+            raise FileNotFoundError(str(src))
+        if src.suffix.lower() != ".session":
+            raise ValueError("file does not end with .session")
+
+        work = SessionSqlReader.clone_sqlite(src)
+        with sqlite3.connect(str(work)) as db:
+            row = db.execute("select dc_id, auth_key from sessions limit 1").fetchone()
+            if not row:
+                raise ValueError("sessions table is empty")
+            dc_id, auth_key = row
+            if auth_key is None:
+                raise ValueError("auth_key is null")
+            auth_key = bytes(auth_key)
+            entities = SessionSqlReader.entity_rows(db)
+
+        uid, profile = SessionSqlReader.pick_profile(entities, uid_override)
+        title = profile.get("name") or profile.get("username") or profile.get("phone") or "Session"
+        return int(dc_id), auth_key, int(uid), profile, title, entities
+
+
+class FileOps:
+    @staticmethod
+    def binary_copy(src, dst):
+        with open(src, "rb") as inp, open(dst, "wb") as out:
+            while True:
+                chunk = inp.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+
+    @staticmethod
+    def readable(path):
+        try:
+            with open(path, "rb") as fh:
+                fh.read(1)
+            return True
+        except Exception:
+            return False
+
+
+class SlotManager:
+    @staticmethod
+    def vacant_slot():
+        Context = jclass("android.content.Context")
+        UserConfig = jclass("org.telegram.messenger.UserConfig")
+        cap = int(getattr(UserConfig, "MAX_ACCOUNT_COUNT", 16) or 16)
+        for slot in range(cap):
+            prefs = AppPaths.ctx().getSharedPreferences(AppPaths.prefs_key(slot), Context.MODE_PRIVATE)
+            if not bool(prefs.contains("user")):
+                return slot
+        raise RuntimeError(f"no free account slot; MAX_ACCOUNT_COUNT={cap}")
+
+    @staticmethod
+    def overview():
+        Context = jclass("android.content.Context")
+        UserConfig = jclass("org.telegram.messenger.UserConfig")
+        cap = int(getattr(UserConfig, "MAX_ACCOUNT_COUNT", 16) or 16)
+        lines = [f"max_accounts={cap}", f"files_dir={AppPaths.internal_root()}"]
+        free = []
+        for slot in range(cap):
+            prefs = AppPaths.ctx().getSharedPreferences(AppPaths.prefs_key(slot), Context.MODE_PRIVATE)
+            has_user = bool(prefs.contains("user"))
+            tgnet = AppPaths.slot_root(slot) / "tgnet.dat"
+            has_tgnet = tgnet.exists()
+            if not has_user:
+                free.append(slot)
+            lines.append(
+                f"{slot}: user={has_user} tgnet={has_tgnet} prefs={AppPaths.prefs_key(slot)} path={tgnet}"
+            )
+        lines.append("free=" + (",".join(str(x) for x in free) if free else "none"))
+        return "\n".join(lines)[:3500]
+
+    @staticmethod
+    def install(slot, tgnet_blob, user_id, profile):
+        Context = jclass("android.content.Context")
+        folder = AppPaths.slot_root(slot)
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / "tgnet.dat"
+        if target.exists():
+            backup = target.with_name(f"tgnet.dat.bak.tg_sess.{int(time.time())}")
+            try:
+                FileOps.binary_copy(target, backup)
+                RuntimeLog.push(f"backup written: {backup}")
+            except Exception as exc:
+                RuntimeLog.push(f"backup skipped: {type(exc).__name__}: {exc}")
+
+        with open(target, "wb") as fh:
+            fh.write(tgnet_blob)
+        try:
+            os.chmod(target, 0o660)
+        except Exception:
+            pass
+
+        prefs = AppPaths.ctx().getSharedPreferences(AppPaths.prefs_key(slot), Context.MODE_PRIVATE)
+        editor = prefs.edit()
+        editor.putString("user", UserBlobEncoder.encode(user_id, profile))
+        editor.putInt("loginTime", int(time.time()))
+        editor.putBoolean("registeredForPush", False)
+        editor.putBoolean("syncContacts", True)
+        editor.putBoolean("suggestContacts", True)
+        if not editor.commit():
+            raise RuntimeError(f"failed to commit {AppPaths.prefs_key(slot)}")
+        return target
+
+
+def apply_session_import(path, uid_override=None):
+    global RECENT_SOURCE
+    RECENT_SOURCE = str(path)
+    dc_id, auth_key, user_id, profile, title, _rows = SessionSqlReader.load(path, uid_override)
+    blob = TgNetBuilder.pack(auth_key, dc_id)
+    slot = SlotManager.vacant_slot()
+    dest = SlotManager.install(slot, blob, user_id, profile)
+    RuntimeLog.push(f"imported slot={slot} user_id={user_id} dc_id={dc_id} display={title} path={dest}")
+    return slot, user_id, dc_id, title, dest
+
+
+class AttachmentResolver:
+    @staticmethod
+    def java_path(obj):
+        try:
+            return str(obj.getAbsolutePath())
+        except Exception:
+            return str(obj)
+
+    @staticmethod
+    def attachment_name(msg):
+        for obj in (msg, getattr(msg, "messageOwner", None)):
+            if obj is None:
+                continue
+            try:
+                name = str(obj.getFileName())
+                if name and name != "null":
+                    return name
+            except Exception:
+                pass
+        return ""
+
+    @staticmethod
+    def from_message(slot, message):
+        if message is None:
+            return None
+        MessageObject = jclass("org.telegram.messenger.MessageObject")
+        FileLoader = jclass("org.telegram.messenger.FileLoader")
+
+        msg = message
+        if "MessageObject" not in str(type(message)):
+            try:
+                msg = MessageObject(int(slot), message, False, True)
+            except Exception:
+                msg = message
+
+        fname = AttachmentResolver.attachment_name(msg).lower()
+        if fname and not fname.endswith(".session"):
+            return None
+
+        owner = getattr(msg, "messageOwner", message)
+        try:
+            attach = str(getattr(owner, "attachPath"))
+            if attach and attach != "null" and Path(attach).exists():
+                return attach
+        except Exception:
+            pass
+        try:
+            resolved = AttachmentResolver.java_path(FileLoader.getInstance(int(slot)).getPathToMessage(owner))
+            if resolved and Path(resolved).exists():
+                return resolved
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def from_reply(slot, params):
+        reply = getattr(params, "replyToMsg", None)
+        if reply is not None and "MessageObject" in str(type(reply)):
+            return AttachmentResolver.from_message(slot, reply)
+        if reply is not None and not isinstance(reply, (int, float, str)):
+            hit = AttachmentResolver.from_message(slot, reply)
+            if hit:
+                return hit
+
+        reply_id = int(reply or 0)
+        if reply_id <= 0:
+            return None
+        peer = int(getattr(params, "peer", 0) or getattr(params, "dialogId", 0) or 0)
+        if peer == 0:
+            return None
+        Storage = jclass("org.telegram.messenger.MessagesStorage")
+        message = Storage.getInstance(int(slot)).getMessage(peer, reply_id)
+        if message is None:
+            return None
+        return AttachmentResolver.from_message(slot, message)
+
+
+class Diagnostics:
+    @staticmethod
+    def session_report(path=None):
+        lines = [f"status: {STATE_NOTE}"]
+        if RECENT_SOURCE:
+            lines.append(f"last: {RECENT_SOURCE}")
+        if path:
+            try:
+                dc_id, auth_key, user_id, profile, title, rows = SessionSqlReader.load(path)
+                lines.append(f"file: {path}")
+                lines.append(f"dc_id: {dc_id}")
+                lines.append(f"auth_key: {len(auth_key)} bytes")
+                lines.append(f"chosen_user_id: {user_id}")
+                lines.append(f"display: {title}")
+                lines.append("candidates:")
+                for item in rows[:8]:
+                    label = item.get("name") or item.get("username") or item.get("phone") or ""
+                    lines.append(f"- {item.get('id')} {label}")
+            except Exception as exc:
+                lines.append(f"diag failed: {type(exc).__name__}: {exc}")
+        return "\n".join(lines)[:3500]
+
+    @staticmethod
+    def hook_report(slot, params):
+        lines = [f"hook ok, account={slot}", f"status={STATE_NOTE}"]
+        for key in ("message", "peer", "replyToMsg", "replyToTopMsg", "path", "document", "caption"):
+            try:
+                val = getattr(params, key)
+                lines.append(f"{key}={type(val).__name__}:{str(val)[:120]}")
+            except Exception:
+                lines.append(f"{key}=<missing>")
+        try:
+            lines.append(f"reply_session_path={AttachmentResolver.from_reply(slot, params)}")
+        except Exception as exc:
+            lines.append(f"reply_lookup_error={type(exc).__name__}: {exc}")
+        return "\n".join(lines)[:3500]
+
+    @staticmethod
+    def preview(path):
+        if not path:
+            return "No .session selected"
+        try:
+            dc_id, auth_key, user_id, _profile, title, rows = SessionSqlReader.load(path)
+            return (
+                f"File: {path}\n"
+                f"User: {title} ({user_id})\n"
+                f"DC: {dc_id}  Auth key: {len(auth_key)} bytes\n"
+                f"Candidates: {len(rows)}"
+            )
+        except Exception as exc:
+            return f"File: {path}\nRead error: {type(exc).__name__}: {exc}"
+
+
+class UiKit:
+    @staticmethod
+    def host():
+        fragment = None
+        if get_last_fragment is not None:
+            try:
+                fragment = get_last_fragment()
+            except Exception:
+                fragment = None
+        activity = None
+        try:
+            activity = fragment.getParentActivity() if fragment is not None else None
+        except Exception:
+            activity = None
+        if activity is None:
+            activity = AppPaths.ctx()
+        return fragment, activity
+
+    @staticmethod
+    def color(key_name, fallback=0xFF888888):
+        try:
+            Theme = jclass("org.telegram.ui.ActionBar.Theme")
+            return int(Theme.getColor(getattr(Theme, key_name)))
+        except Exception:
+            return int(fallback)
+
+    @staticmethod
+    def dp(value):
+        try:
+            AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+            return int(AndroidUtilities.dp(float(value)))
+        except Exception:
+            return int(value)
+
+    @staticmethod
+    def set_text(view, text):
+        try:
+            view.setText(str(text))
+        except Exception:
+            pass
+
+
+class TelegramSessionImporterPlugin(BasePlugin):
+    def on_plugin_load(self):
+        RuntimeLog.push("plugin loaded; commands: .imp, .impdiag, .impstatus")
+        try:
+            self.add_on_send_message_hook()
+            RuntimeLog.push("send hook registered")
+        except Exception as exc:
+            RuntimeLog.push(f"send hook registration failed: {type(exc).__name__}: {exc}")
+
+    def on_plugin_unload(self):
+        try:
+            return self.remove_on_send_message_hook()
+        except Exception:
+            try:
+                return self.rremove_on_send_message_hook()
+            except Exception:
+                return None
+
+    def create_settings(self):
+        if Header is None or Text is None:
+            return []
+        rows = [
+            Header("Telegram session importer"),
+            Text(
+                text="Open importer",
+                subtext="Use a downloaded reply file or paste an internal readable path",
+                icon="msg_openin",
+                on_click=lambda view=None: self.open_import_dialog(0, None),
+            ),
+            Text(
+                text="Show slots",
+                subtext="Print current account slot state to plugin log",
+                icon="msg_info",
+                on_click=lambda view=None: RuntimeLog.push(SlotManager.overview()),
+            ),
+        ]
+        if Divider is not None:
+            rows.insert(1, Divider())
+        return rows
+
+    def notify(self, text, error=False):
+        if BulletinHelper is None:
+            return
+        try:
+            if error:
+                BulletinHelper.show_error(text)
+            else:
+                BulletinHelper.show_info(text)
+        except Exception:
+            pass
+
+    def replace_outgoing(self, params, text):
+        try:
+            setattr(params, "message", text[:3500])
+        except Exception:
+            pass
+
+    def open_import_dialog(self, slot, params=None):
+        def build():
+            try:
+                if AlertDialogBuilder is None:
+                    self.notify("AlertDialogBuilder unavailable", error=True)
+                    return
+                _fragment, activity = UiKit.host()
+                LinearLayout = jclass("android.widget.LinearLayout")
+                TextView = jclass("android.widget.TextView")
+                ScrollView = jclass("android.widget.ScrollView")
+                ViewGroup = jclass("android.view.ViewGroup")
+                InputType = jclass("android.text.InputType")
+                EditTextBoldCursor = jclass("org.telegram.ui.Components.EditTextBoldCursor")
+                AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
+
+                reply_path = AttachmentResolver.from_reply(slot, params) if params is not None else None
+                black = UiKit.color("key_windowBackgroundWhiteBlackText", 0xFF111111)
+                gray = UiKit.color("key_windowBackgroundWhiteGrayText", 0xFF777777)
+                hint = UiKit.color("key_windowBackgroundWhiteHintText", 0xFF999999)
+                accent = UiKit.color("key_windowBackgroundWhiteBlueText4", 0xFF2F80ED)
+                green = UiKit.color("key_windowBackgroundWhiteGreenText", 0xFF2A9D55)
+                red = UiKit.color("key_text_RedRegular", 0xFFE53935)
+
+                lp = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                root = LinearLayout(activity)
+                root.setOrientation(LinearLayout.VERTICAL)
+                root.setPadding(UiKit.dp(18), UiKit.dp(8), UiKit.dp(18), UiKit.dp(8))
+
+                def caption(text, size=13, color=None, top=10):
+                    view = TextView(activity)
+                    view.setText(str(text))
+                    view.setTextSize(float(size))
+                    view.setTextColor(int(gray if color is None else color))
+                    view.setPadding(0, UiKit.dp(top), 0, UiKit.dp(2))
+                    return view
+
+                def body(text, color=None):
+                    view = TextView(activity)
+                    view.setText(str(text))
+                    view.setTextSize(14.0)
+                    view.setTextColor(int(black if color is None else color))
+                    view.setPadding(0, UiKit.dp(2), 0, UiKit.dp(2))
+                    return view
+
+                def field(text, field_hint, numeric=False):
+                    view = EditTextBoldCursor(activity)
+                    view.setTextSize(15.0)
+                    view.setTextColor(int(black))
+                    view.setHintTextColor(int(hint))
+                    view.setHint(str(field_hint))
+                    view.setPadding(0, UiKit.dp(5), 0, UiKit.dp(5))
+                    try:
+                        view.setSingleLine(True)
+                    except Exception:
+                        pass
+                    if numeric:
+                        try:
+                            view.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED)
+                        except Exception:
+                            pass
+                    if text:
+                        try:
+                            view.setText(str(text))
+                            view.setSelection(len(str(text)))
+                        except Exception:
+                            pass
+                    return view
+
+                heading = body("Telegram session importer", accent)
+                try:
+                    heading.setTextSize(17.0)
+                    heading.setTypeface(AndroidUtilities.getTypeface("fonts/rmedium.ttf"))
+                except Exception:
+                    pass
+                root.addView(heading, lp)
+
+                reply_label = "Reply file detected" if reply_path else "No reply file detected"
+                root.addView(caption(reply_label, 12, green if reply_path else gray, 8), lp)
+                root.addView(body(reply_path or "Reply to a downloaded .session, or paste a readable internal path below."), lp)
+
+                root.addView(caption("Path override", 12, None, 12), lp)
+                path_input = field("", "/storage/emulated/0/Android/data/.../file.session")
+                root.addView(path_input, lp)
+
+                root.addView(caption("User ID override", 12, None, 10), lp)
+                user_input = field("", "optional; leave empty for auto-detect", numeric=True)
+                root.addView(user_input, lp)
+
+                preview = body(Diagnostics.preview(reply_path) if reply_path else "Preview appears after import or when using a reply file.", gray)
+                root.addView(caption("Preview", 12, None, 12), lp)
+                root.addView(preview, lp)
+
+                status = body("Ready", accent)
+                root.addView(caption("Status", 12, None, 12), lp)
+                root.addView(status, lp)
+
+                slots = body(SlotManager.overview(), gray)
+                root.addView(caption("Slots", 12, None, 12), lp)
+                root.addView(slots, lp)
+
+                scroll = ScrollView(activity)
+                scroll.addView(root)
+
+                builder = AlertDialogBuilder(activity)
+                builder.set_title("Import .session")
+                builder.set_view(scroll)
+                try:
+                    builder.set_blurred_background(True)
+                except Exception:
+                    pass
+
+                def paint_status(text, color=accent):
+                    def apply():
+                        try:
+                            status.setText(str(text))
+                            status.setTextColor(int(color))
+                        except Exception:
+                            pass
+                    run_on_ui_thread(apply)
+
+                def refresh_slots():
+                    def apply():
+                        UiKit.set_text(slots, SlotManager.overview())
+                    run_on_ui_thread(apply)
+
+                def on_import(d, _which):
+                    chosen = reply_path
+                    typed = ""
+                    try:
+                        typed = str(path_input.getText().toString() or "").strip()
+                    except Exception:
+                        typed = ""
+                    if not chosen and typed:
+                        chosen = typed
+                    if not chosen:
+                        paint_status("Select a downloaded reply file or paste a readable path.", red)
+                        return
+                    override = None
+                    try:
+                        raw_uid = str(user_input.getText().toString() or "").strip()
+                        override = int(raw_uid) if raw_uid else None
+                    except Exception:
+                        paint_status("User ID override must be numeric.", red)
+                        return
+
+                    paint_status("Importing...", accent)
+
+                    def worker():
+                        try:
+                            slot_id, user_id, dc_id, title, destination = apply_session_import(chosen, override)
+                            msg = (
+                                f"Imported slot {slot_id}\n"
+                                f"User {title} ({user_id})\n"
+                                f"DC {dc_id}\n"
+                                "Force-stop and reopen the client."
+                            )
+
+                            def done():
+                                UiKit.set_text(preview, Diagnostics.preview(chosen))
+                                UiKit.set_text(status, msg)
+                                status.setTextColor(int(green))
+                                UiKit.set_text(slots, SlotManager.overview())
+                                self.notify("session import finished")
+
+                            run_on_ui_thread(done)
+                        except Exception as exc:
+                            err = f"{type(exc).__name__}: {exc}"
+                            RuntimeLog.push("ui import failed: " + err)
+                            RuntimeLog.push(traceback.format_exc())
+                            paint_status(err, red)
+                            self.notify(err, error=True)
+
+                    run_on_queue(worker)
+
+                def on_preview(d, _which):
+                    chosen = reply_path
+                    try:
+                        typed = str(path_input.getText().toString() or "").strip()
+                        if typed:
+                            chosen = typed
+                    except Exception:
+                        pass
+                    UiKit.set_text(preview, Diagnostics.preview(chosen))
+                    refresh_slots()
+
+                builder.set_positive_button("Import", on_import)
+                builder.set_neutral_button("Preview", on_preview)
+                builder.set_negative_button("Close", lambda d, w: d.dismiss())
+                builder.show()
+            except Exception as exc:
+                RuntimeLog.push("ui failed: " + traceback.format_exc())
+                self.notify(f"UI failed: {type(exc).__name__}: {exc}", error=True)
+
+        run_on_ui_thread(build)
+
+    def run_import_command(self, slot, params, text):
+        try:
+            parts = shlex.split(text)
+        except Exception:
+            parts = text.split()
+        explicit_path = ""
+        uid_override = None
+        if len(parts) >= 2:
+            explicit_path = parts[1].strip().strip('"').strip("'")
+        if len(parts) >= 3:
+            uid_override = int(parts[2])
+
+        reply_path = AttachmentResolver.from_reply(slot, params)
+        if reply_path:
+            session_path = reply_path
+        elif explicit_path:
+            session_path = explicit_path
+        else:
+            return (
+                "session importer: reply to a downloaded .session file or use\n"
+                ".imp /full/path/file.session\n"
+                "If user id is detected wrong: .imp /full/path/file.session USER_ID"
+            )
+
+        if explicit_path and session_path == explicit_path and not FileOps.readable(session_path):
+            return (
+                "session importer: this path is not readable by the client:\n"
+                f"{session_path}\n"
+                "Send the .session to Saved Messages, download it, reply to it with .imp."
+            )
+
+        slot_id, user_id, dc_id, title, destination = apply_session_import(session_path, uid_override)
+        return (
+            "session importer: imported\n"
+            f"slot: {slot_id}\n"
+            f"user_id: {user_id}\n"
+            f"dc_id: {dc_id}\n"
+            f"name: {title}\n"
+            "Now fully force-stop and reopen the client."
+        )
+
+    def on_send_message_hook(self, slot, params):
+        result = HookResult()
+        try:
+            message_text = getattr(params, "message", None)
+            if not isinstance(message_text, str):
+                return result
+            text = message_text.strip()
+            lowered = text.lower()
+
+            if lowered == ".impstatus":
+                self.replace_outgoing(params, Diagnostics.session_report())
+                return result
+
+            if lowered == ".impslots":
+                self.replace_outgoing(params, SlotManager.overview())
+                return result
+
+            if lowered == ".impui":
+                self.open_import_dialog(slot, params)
+                self.replace_outgoing(params, "session importer: UI opened")
+                return result
+
+            if lowered == ".impdiag" or lowered.startswith(".impdiag "):
+                path = text.split(" ", 1)[1].strip().strip('"').strip("'") if " " in text else None
+                payload = Diagnostics.hook_report(slot, params) if not path else Diagnostics.session_report(path)
+                self.replace_outgoing(params, payload)
+                return result
+
+            if lowered == ".imp" or lowered.startswith(".imp "):
+                try:
+                    if lowered == ".imp" and not AttachmentResolver.from_reply(slot, params):
+                        self.open_import_dialog(slot, params)
+                        self.replace_outgoing(params, "session importer: UI opened")
+                        return result
+                    reply = self.run_import_command(slot, params, text)
+                    self.notify("session import finished")
+                except Exception as exc:
+                    reply = f"session importer failed: {type(exc).__name__}: {exc}"
+                    RuntimeLog.push(reply)
+                    RuntimeLog.push(traceback.format_exc())
+                    self.notify(reply, error=True)
+                self.replace_outgoing(params, reply)
+                return result
+        except Exception as exc:
+            RuntimeLog.push(f"send hook error: {type(exc).__name__}: {exc}")
+            RuntimeLog.push(traceback.format_exc())
+        return result
