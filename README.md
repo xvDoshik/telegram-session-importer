@@ -1,38 +1,39 @@
-# Telegram session importer
+EN | [RU](docs/README_RU.md)
 
-Плагин для AyuGram / exteraGram: импорт `.session` файлов в свободный слот аккаунта.
+## Telegram session importer 📲
 
-**Автор:** xv_Dosha  
-**Версия:** 1.0.0
+Plugin for AyuGram / exteraGram: import `.session` files into a free account slot.
 
-## Установка
+**Version:** 1.0.0
 
-1. Скопируй `telegram_session_importer.plugin` в папку плагинов клиента
-2. Включи плагин в настройках
-3. Перезапусти клиент
+## 🚀 Quick start
 
-## Команды
+1. Copy `telegram_session_importer.plugin` to the client plugins folder
+2. Enable the plugin in settings
+3. Restart the client
 
-| Команда | Описание |
+## 📋 Commands
+
+| Command | Description |
 |---------|----------|
-| `.imp` | Импорт (reply на `.session` или путь) |
-| `.impui` | Открыть UI импорта |
-| `.impdiag` | Диагностика |
-| `.impstatus` | Статус последнего импорта |
-| `.impslots` | Состояние слотов аккаунтов |
+| `.imp` | Import (reply to `.session` or path) |
+| `.impui` | Open import UI |
+| `.impdiag` | Diagnostics |
+| `.impstatus` | Last import status |
+| `.impslots` | Account slot state |
 
-## Использование
+## 🎮 Usage
 
-1. Отправь `.session` в Saved Messages
-2. Скачай файл
-3. Ответь на него командой `.imp`
+1. Send a `.session` to Saved Messages
+2. Download the file
+3. Reply with `.imp`
 
-Или: `.imp /full/path/to/file.session`  
-Если user id неверный: `.imp /path/file.session USER_ID`
+Or: `.imp /full/path/to/file.session`  
+If user id is wrong: `.imp /path/file.session USER_ID`
 
-После импорта — **полный force-stop** и перезапуск клиента.
+After import - full force-stop and restart the client.
 
-## Требования
+## ⚙️ Requirements
 
 - AyuGram / exteraGram `>= 11.12.0`
 - Telethon-compatible `.session` (SQLite)
