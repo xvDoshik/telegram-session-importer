@@ -48,13 +48,99 @@ __id__ = "telegram_session_importer"
 __name__ = "Telegram session importer"
 __description__ = "Imports Telegram .session files into AyuGram/exteraGram account slots."
 __author__ = "xv_Dosha"
-__version__ = "1.0.0"
+__version__ = "1.3.0"
 __icon__ = "msg_plugins"
 __min_version__ = "11.12.0"
 
 LOG_TAG = "[tg_sess]"
 STATE_NOTE = "idle"
 RECENT_SOURCE = ""
+IMPORT_TRIGGERS = (
+    ".imp",
+    "imp",
+    ".имп",
+    "имп",
+    "import",
+    ".import",
+    "импорт",
+    ".импорт",
+)
+
+
+class ImportCommands:
+    @staticmethod
+    def match(text):
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        low = raw.lower()
+        for cmd in IMPORT_TRIGGERS:
+            if low == cmd:
+                return ""
+            prefix = cmd + " "
+            if low.startswith(prefix):
+                return raw[len(prefix):].strip()
+        return None
+
+    @staticmethod
+    def to_imp_text(rest):
+        rest = str(rest or "").strip()
+        return f".imp {rest}".strip()
+
+
+class SessionIndex:
+    _items = {}
+
+    @staticmethod
+    def _key(account, dialog_id):
+        return int(account), int(dialog_id)
+
+    @staticmethod
+    def remember(account, dialog_id, msg_id, fname=""):
+        key = SessionIndex._key(account, dialog_id)
+        bucket = SessionIndex._items.setdefault(key, [])
+        bucket.append({
+            "msg_id": int(msg_id),
+            "fname": str(fname or ""),
+            "ts": int(time.time()),
+        })
+        SessionIndex._items[key] = bucket[-12:]
+
+    @staticmethod
+    def latest(account, dialog_id):
+        key = SessionIndex._key(account, dialog_id)
+        bucket = SessionIndex._items.get(key) or []
+        if not bucket:
+            return 0
+        return int(bucket[-1]["msg_id"])
+
+
+class IncomingMessageInspector:
+    @staticmethod
+    def session_filename(message):
+        if message is None:
+            return ""
+        media = getattr(message, "media", None)
+        if media is None:
+            return ""
+        document = getattr(media, "document", None)
+        if document is None:
+            return ""
+        for key in ("file_name", "fileName"):
+            try:
+                name = str(getattr(document, key, "") or "").strip()
+                if name.lower().endswith(".session"):
+                    return name
+            except Exception:
+                pass
+        for key in ("file_name", "fileName"):
+            try:
+                name = str(getattr(media, key, "") or "").strip()
+                if name.lower().endswith(".session"):
+                    return name
+            except Exception:
+                pass
+        return ""
 
 
 class DcRegistry:
@@ -342,15 +428,31 @@ class SessionSqlReader:
         return out
 
     @staticmethod
-    def pick_profile(rows, uid_override=None):
+    def session_user_id(db):
+        cols = SessionSqlReader.columns(db, "sessions")
+        if "user_id" not in cols:
+            return None
+        row = db.execute("select user_id from sessions where user_id is not null and user_id > 0 limit 1").fetchone()
+        if not row or row[0] is None:
+            return None
+        return int(row[0])
+
+    @staticmethod
+    def pick_profile(rows, uid_override=None, session_user_id=None):
         if uid_override:
             uid = int(uid_override)
             for row in rows:
                 if int(row.get("id") or 0) == uid:
                     return uid, row
             return uid, {"first_name": "Session", "last_name": "", "username": "", "phone": "", "name": ""}
+        if session_user_id:
+            uid = int(session_user_id)
+            for row in rows:
+                if int(row.get("id") or 0) == uid:
+                    return uid, row
+            return uid, {"first_name": "Session", "last_name": "", "username": "", "phone": "", "name": ""}
         if not rows:
-            raise ValueError("could not infer user id from entities table; use .imp /path/file.session USER_ID")
+            raise ValueError("could not infer user id; reply with .imp USER_ID or use .imp /path/file.session USER_ID")
         ranked = sorted(
             rows,
             key=lambda item: (
@@ -391,10 +493,84 @@ class SessionSqlReader:
                 raise ValueError("auth_key is null")
             auth_key = bytes(auth_key)
             entities = SessionSqlReader.entity_rows(db)
+            stored_uid = SessionSqlReader.session_user_id(db)
 
-        uid, profile = SessionSqlReader.pick_profile(entities, uid_override)
+        uid, profile = SessionSqlReader.pick_profile(entities, uid_override, stored_uid)
         title = profile.get("name") or profile.get("username") or profile.get("phone") or "Session"
         return int(dc_id), auth_key, int(uid), profile, title, entities
+
+
+class PathFinder:
+    @staticmethod
+    def search_dirs():
+        dirs = [
+            Path("/storage/emulated/0/Download"),
+            Path("/sdcard/Download"),
+            Path("/storage/emulated/0/Documents"),
+            Path("/sdcard/Documents"),
+            Path("/storage/emulated/0/Telegram"),
+            Path("/sdcard/Telegram"),
+            Path("/storage/emulated/0/Android/data"),
+        ]
+        try:
+            ext = AppPaths.ctx().getExternalFilesDir(None)
+            if ext is not None:
+                base = Path(str(ext.getAbsolutePath()))
+                dirs.extend([base, base / "Telegram", base / "Download"])
+        except Exception:
+            pass
+        try:
+            dirs.append(AppPaths.internal_root())
+            dirs.append(AppPaths.scratch_dir())
+        except Exception:
+            pass
+        out = []
+        seen = set()
+        for item in dirs:
+            key = str(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    @staticmethod
+    def normalize_name(token):
+        name = str(token or "").strip().strip('"').strip("'")
+        if not name:
+            return ""
+        if name.endswith(".session"):
+            return name
+        if name.isdigit():
+            return f"{name}.session"
+        return name if name.lower().endswith(".session") else f"{name}.session"
+
+    @staticmethod
+    def resolve(token, uid_hint=None):
+        if not token:
+            return None
+        raw = str(token).strip().strip('"').strip("'")
+        direct = Path(raw)
+        if direct.is_absolute() and direct.exists() and direct.is_file():
+            return str(direct)
+        name = PathFinder.normalize_name(raw)
+        for folder in PathFinder.search_dirs():
+            try:
+                hit = folder / name
+                if hit.exists() and hit.is_file():
+                    return str(hit)
+            except Exception:
+                pass
+            try:
+                for hit in folder.rglob(name):
+                    if hit.is_file():
+                        return str(hit)
+            except Exception:
+                pass
+        if uid_hint:
+            alt = PathFinder.normalize_name(str(uid_hint))
+            return PathFinder.resolve(alt)
+        return None
 
 
 class FileOps:
@@ -415,6 +591,21 @@ class FileOps:
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def stage_session(path):
+        src = Path(str(path))
+        if not src.exists() or not src.is_file():
+            raise FileNotFoundError(str(src))
+        if src.suffix.lower() != ".session":
+            raise ValueError("file does not end with .session")
+        dst = AppPaths.scratch_dir() / f"import_{src.stem}_{int(time.time() * 1000)}.session"
+        FileOps.binary_copy(src, dst)
+        try:
+            os.chmod(dst, 0o600)
+        except Exception:
+            pass
+        return str(dst)
 
 
 class SlotManager:
@@ -484,8 +675,9 @@ class SlotManager:
 
 def apply_session_import(path, uid_override=None):
     global RECENT_SOURCE
-    RECENT_SOURCE = str(path)
-    dc_id, auth_key, user_id, profile, title, _rows = SessionSqlReader.load(path, uid_override)
+    staged = FileOps.stage_session(path)
+    RECENT_SOURCE = staged
+    dc_id, auth_key, user_id, profile, title, _rows = SessionSqlReader.load(staged, uid_override)
     blob = TgNetBuilder.pack(auth_key, dc_id)
     slot = SlotManager.vacant_slot()
     dest = SlotManager.install(slot, blob, user_id, profile)
@@ -515,6 +707,11 @@ class AttachmentResolver:
         return ""
 
     @staticmethod
+    def looks_like_session(path, fname=""):
+        name = (fname or Path(str(path)).name).lower()
+        return name.endswith(".session")
+
+    @staticmethod
     def from_message(slot, message):
         if message is None:
             return None
@@ -528,39 +725,86 @@ class AttachmentResolver:
             except Exception:
                 msg = message
 
-        fname = AttachmentResolver.attachment_name(msg).lower()
-        if fname and not fname.endswith(".session"):
-            return None
-
+        fname = AttachmentResolver.attachment_name(msg)
         owner = getattr(msg, "messageOwner", message)
+
+        candidates = []
         try:
             attach = str(getattr(owner, "attachPath"))
-            if attach and attach != "null" and Path(attach).exists():
-                return attach
+            if attach and attach != "null":
+                candidates.append(attach)
         except Exception:
             pass
         try:
             resolved = AttachmentResolver.java_path(FileLoader.getInstance(int(slot)).getPathToMessage(owner))
-            if resolved and Path(resolved).exists():
-                return resolved
+            if resolved:
+                candidates.append(resolved)
         except Exception:
             pass
+        try:
+            doc = getattr(owner, "media", None)
+            if doc is not None:
+                doc_name = AttachmentResolver.attachment_name(doc)
+                if doc_name:
+                    fname = fname or doc_name
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            path = Path(str(candidate))
+            if path.exists() and path.is_file():
+                if AttachmentResolver.looks_like_session(path, fname):
+                    return str(path)
+                if fname and fname.lower().endswith(".session"):
+                    return str(path)
+        if fname and fname.lower().endswith(".session"):
+            for candidate in candidates:
+                if candidate and Path(str(candidate)).exists():
+                    return str(candidate)
         return None
+
+    @staticmethod
+    def peer_id(params):
+        for key in ("peer", "dialogId", "peerId", "chatId"):
+            try:
+                val = int(getattr(params, key, 0) or 0)
+                if val:
+                    return val
+            except Exception:
+                pass
+        return 0
 
     @staticmethod
     def from_reply(slot, params):
         reply = getattr(params, "replyToMsg", None)
         if reply is not None and "MessageObject" in str(type(reply)):
-            return AttachmentResolver.from_message(slot, reply)
+            hit = AttachmentResolver.from_message(slot, reply)
+            if hit:
+                return hit
         if reply is not None and not isinstance(reply, (int, float, str)):
             hit = AttachmentResolver.from_message(slot, reply)
             if hit:
                 return hit
 
-        reply_id = int(reply or 0)
+        reply_id = 0
+        try:
+            reply_id = int(reply or 0)
+        except Exception:
+            reply_id = 0
+        if reply_id <= 0:
+            for key in ("replyToTopMsg", "replyToMsgId"):
+                try:
+                    reply_id = int(getattr(params, key, 0) or 0)
+                    if reply_id > 0:
+                        break
+                except Exception:
+                    pass
         if reply_id <= 0:
             return None
-        peer = int(getattr(params, "peer", 0) or getattr(params, "dialogId", 0) or 0)
+
+        peer = AttachmentResolver.peer_id(params)
         if peer == 0:
             return None
         Storage = jclass("org.telegram.messenger.MessagesStorage")
@@ -568,6 +812,58 @@ class AttachmentResolver:
         if message is None:
             return None
         return AttachmentResolver.from_message(slot, message)
+
+    @staticmethod
+    def from_outgoing(slot, params):
+        for key in ("path", "caption", "document", "media", "photo", "video", "audio", "file"):
+            try:
+                val = getattr(params, key, None)
+            except Exception:
+                val = None
+            if val is None:
+                continue
+            if isinstance(val, str):
+                token = val.strip()
+                if token.lower().endswith(".session"):
+                    found = PathFinder.resolve(token)
+                    if found:
+                        return found
+                    if Path(token).exists():
+                        return token
+                continue
+            hit = AttachmentResolver.from_message(slot, val)
+            if hit:
+                return hit
+        return None
+
+    @staticmethod
+    def from_chat_index(slot, params):
+        dialog_id = AttachmentResolver.peer_id(params)
+        if not dialog_id:
+            return None
+        msg_id = SessionIndex.latest(slot, dialog_id)
+        if msg_id <= 0:
+            return None
+        Storage = jclass("org.telegram.messenger.MessagesStorage")
+        message = Storage.getInstance(int(slot)).getMessage(int(dialog_id), int(msg_id))
+        if message is None:
+            return None
+        return AttachmentResolver.from_message(slot, message)
+
+    @staticmethod
+    def from_params(slot, params):
+        for resolver in (
+            lambda: AttachmentResolver.from_reply(slot, params),
+            lambda: AttachmentResolver.from_outgoing(slot, params),
+            lambda: AttachmentResolver.from_chat_index(slot, params),
+        ):
+            try:
+                hit = resolver()
+                if hit:
+                    return hit
+            except Exception:
+                pass
+        return None
 
 
 class Diagnostics:
@@ -602,7 +898,7 @@ class Diagnostics:
             except Exception:
                 lines.append(f"{key}=<missing>")
         try:
-            lines.append(f"reply_session_path={AttachmentResolver.from_reply(slot, params)}")
+            lines.append(f"reply_session_path={AttachmentResolver.from_params(slot, params)}")
         except Exception as exc:
             lines.append(f"reply_lookup_error={type(exc).__name__}: {exc}")
         return "\n".join(lines)[:3500]
@@ -667,12 +963,54 @@ class UiKit:
 
 class TelegramSessionImporterPlugin(BasePlugin):
     def on_plugin_load(self):
-        RuntimeLog.push("plugin loaded; commands: .imp, .impdiag, .impstatus")
+        RuntimeLog.push("plugin loaded; commands: .imp, имп, .impdiag, .impstatus")
         try:
             self.add_on_send_message_hook()
             RuntimeLog.push("send hook registered")
         except Exception as exc:
             RuntimeLog.push(f"send hook registration failed: {type(exc).__name__}: {exc}")
+        try:
+            self.add_hook("TL_updateNewMessage")
+            RuntimeLog.push("incoming hook registered")
+        except Exception as exc:
+            RuntimeLog.push(f"incoming hook registration failed: {type(exc).__name__}: {exc}")
+
+    def on_update_hook(self, update_name, account, update):
+        result = HookResult()
+        if update_name != "TL_updateNewMessage":
+            return result
+        try:
+            message = getattr(update, "message", None)
+            if message is None:
+                return result
+            if bool(getattr(message, "out", False)):
+                return result
+            dialog_id = int(getattr(message, "dialog_id", 0) or 0)
+            msg_id = int(getattr(message, "id", 0) or 0)
+            fname = IncomingMessageInspector.session_filename(message)
+            if dialog_id and msg_id and fname:
+                SessionIndex.remember(account, dialog_id, msg_id, fname)
+                RuntimeLog.push(f"indexed session {fname} chat={dialog_id} msg={msg_id}")
+        except Exception as exc:
+            RuntimeLog.push(f"incoming index failed: {type(exc).__name__}: {exc}")
+        return result
+
+    def handle_import_command(self, slot, params, text):
+        try:
+            if ImportCommands.match(text) is not None and not text.lower().startswith(".imp"):
+                text = ImportCommands.to_imp_text(ImportCommands.match(text))
+            if text.strip().lower() in (".imp",) and not AttachmentResolver.from_params(slot, params):
+                self.open_import_dialog(slot, params)
+                return "session importer: UI opened"
+            reply = self.run_import_command(slot, params, text)
+            self.notify("session import finished")
+            return reply
+        except Exception as exc:
+            reply = f"session importer failed: {type(exc).__name__}: {exc}"
+            RuntimeLog.push(reply)
+            RuntimeLog.push(traceback.format_exc())
+            self.notify(reply, error=True)
+            return reply
 
     def on_plugin_unload(self):
         try:
@@ -690,7 +1028,7 @@ class TelegramSessionImporterPlugin(BasePlugin):
             Header("Telegram session importer"),
             Text(
                 text="Open importer",
-                subtext="Use a downloaded reply file or paste an internal readable path",
+                subtext="Reply to a downloaded .session, attach a file, or paste a path",
                 icon="msg_openin",
                 on_click=lambda view=None: self.open_import_dialog(0, None),
             ),
@@ -737,7 +1075,7 @@ class TelegramSessionImporterPlugin(BasePlugin):
                 EditTextBoldCursor = jclass("org.telegram.ui.Components.EditTextBoldCursor")
                 AndroidUtilities = jclass("org.telegram.messenger.AndroidUtilities")
 
-                reply_path = AttachmentResolver.from_reply(slot, params) if params is not None else None
+                reply_path = AttachmentResolver.from_params(slot, params) if params is not None else None
                 black = UiKit.color("key_windowBackgroundWhiteBlackText", 0xFF111111)
                 gray = UiKit.color("key_windowBackgroundWhiteGrayText", 0xFF777777)
                 hint = UiKit.color("key_windowBackgroundWhiteHintText", 0xFF999999)
@@ -798,9 +1136,9 @@ class TelegramSessionImporterPlugin(BasePlugin):
                     pass
                 root.addView(heading, lp)
 
-                reply_label = "Reply file detected" if reply_path else "No reply file detected"
+                reply_label = "Attached .session detected" if reply_path else "No attached .session detected"
                 root.addView(caption(reply_label, 12, green if reply_path else gray, 8), lp)
-                root.addView(body(reply_path or "Reply to a downloaded .session, or paste a readable internal path below."), lp)
+                root.addView(body(reply_path or "Reply to a downloaded .session in any chat, attach a file with .imp, or paste a path below."), lp)
 
                 root.addView(caption("Path override", 12, None, 12), lp)
                 path_input = field("", "/storage/emulated/0/Android/data/.../file.session")
@@ -922,31 +1260,46 @@ class TelegramSessionImporterPlugin(BasePlugin):
             parts = shlex.split(text)
         except Exception:
             parts = text.split()
-        explicit_path = ""
+        explicit_token = ""
         uid_override = None
         if len(parts) >= 2:
-            explicit_path = parts[1].strip().strip('"').strip("'")
+            token = parts[1].strip().strip('"').strip("'")
+            if token.isdigit():
+                uid_override = int(token)
+            else:
+                explicit_token = token
         if len(parts) >= 3:
             uid_override = int(parts[2])
 
-        reply_path = AttachmentResolver.from_reply(slot, params)
-        if reply_path:
-            session_path = reply_path
-        elif explicit_path:
-            session_path = explicit_path
-        else:
+        session_path = AttachmentResolver.from_params(slot, params)
+        if not session_path and explicit_token:
+            session_path = PathFinder.resolve(explicit_token, uid_hint=uid_override)
+        if not session_path and explicit_token and Path(explicit_token).exists():
+            session_path = explicit_token
+
+        if not session_path:
             return (
-                "session importer: reply to a downloaded .session file or use\n"
-                ".imp /full/path/file.session\n"
-                "If user id is detected wrong: .imp /full/path/file.session USER_ID"
+                "session importer: no .session found\n"
+                "Any chat:\n"
+                "1) someone sends .session -> download -> reply имп\n"
+                "2) someone sends .session -> download -> write имп\n"
+                "3) attach .session and send with caption имп\n"
+                "4) .imp /sdcard/Download/file.session\n"
+                "5) .imp 5493225021  (searches Download)\n"
+                "Optional user id: .imp file.session USER_ID"
             )
 
-        if explicit_path and session_path == explicit_path and not FileOps.readable(session_path):
+        if not FileOps.readable(session_path):
             return (
-                "session importer: this path is not readable by the client:\n"
+                "session importer: file is not readable yet:\n"
                 f"{session_path}\n"
-                "Send the .session to Saved Messages, download it, reply to it with .imp."
+                "Download the attachment first, then reply with имп / .imp in this chat."
             )
+
+        if uid_override is None:
+            stem = Path(str(session_path)).stem
+            if stem.isdigit():
+                uid_override = int(stem)
 
         slot_id, user_id, dc_id, title, destination = apply_session_import(session_path, uid_override)
         return (
@@ -986,20 +1339,9 @@ class TelegramSessionImporterPlugin(BasePlugin):
                 self.replace_outgoing(params, payload)
                 return result
 
-            if lowered == ".imp" or lowered.startswith(".imp "):
-                try:
-                    if lowered == ".imp" and not AttachmentResolver.from_reply(slot, params):
-                        self.open_import_dialog(slot, params)
-                        self.replace_outgoing(params, "session importer: UI opened")
-                        return result
-                    reply = self.run_import_command(slot, params, text)
-                    self.notify("session import finished")
-                except Exception as exc:
-                    reply = f"session importer failed: {type(exc).__name__}: {exc}"
-                    RuntimeLog.push(reply)
-                    RuntimeLog.push(traceback.format_exc())
-                    self.notify(reply, error=True)
-                self.replace_outgoing(params, reply)
+            rest = ImportCommands.match(text)
+            if rest is not None:
+                self.replace_outgoing(params, self.handle_import_command(slot, params, ImportCommands.to_imp_text(rest)))
                 return result
         except Exception as exc:
             RuntimeLog.push(f"send hook error: {type(exc).__name__}: {exc}")

@@ -4,7 +4,7 @@
 
 Плагин для AyuGram / exteraGram: импорт `.session` файлов в свободный слот аккаунта.
 
-**Версия:** 1.0.0
+**Версия:** 1.3.0
 
 ## 🚀 Quick start
 
@@ -24,16 +24,25 @@
 
 ## 🎮 Usage
 
-1. Отправь `.session` в Saved Messages
-2. Скачай файл
-3. Ответь на него командой `.imp`
+Работает в **любом чате**.
 
-Или: `.imp /full/path/to/file.session`  
-Если user id неверный: `.imp /path/file.session USER_ID`
+**Кто-то кинул `.session`:**
+1. Скачай файл
+2. Reply **`имп`** или просто напиши **`имп`** в этом чате
+
+Команды: `имп`, `.imp`, `imp`, `import`
+
+Или прикрепи `.session` и отправь с подписью `имп`.
+
+Или по пути:
+```
+.imp /sdcard/Download/5493225021.session
+.imp 5493225021
+```
 
 После импорта - **полный force-stop** и перезапуск клиента.
 
 ## ⚙️ Requirements
 
 - AyuGram / exteraGram `>= 11.12.0`
-- Telethon-compatible `.session` (SQLite)
+- Telethon или Pyrogram `.session` (SQLite)

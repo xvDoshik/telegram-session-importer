@@ -4,7 +4,7 @@ EN | [RU](docs/README_RU.md)
 
 Plugin for AyuGram / exteraGram: import `.session` files into a free account slot.
 
-**Version:** 1.0.0
+**Version:** 1.3.0
 
 ## 🚀 Quick start
 
@@ -24,16 +24,23 @@ Plugin for AyuGram / exteraGram: import `.session` files into a free account slo
 
 ## 🎮 Usage
 
-1. Send a `.session` to Saved Messages
-2. Download the file
-3. Reply with `.imp`
+Works in **any chat**, not only Saved Messages.
 
-Or: `.imp /full/path/to/file.session`  
-If user id is wrong: `.imp /path/file.session USER_ID`
+1. Download a `.session` file
+2. Reply to it with `.imp`
+
+Or attach `.session` and send with caption `.imp`.
+
+Or by path / name:
+```
+.imp /sdcard/Download/5493225021.session
+.imp 5493225021
+.imp /path/file.session USER_ID
+```
 
 After import - full force-stop and restart the client.
 
 ## ⚙️ Requirements
 
 - AyuGram / exteraGram `>= 11.12.0`
-- Telethon-compatible `.session` (SQLite)
+- Telethon or Pyrogram `.session` (SQLite)
